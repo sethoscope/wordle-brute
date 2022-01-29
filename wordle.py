@@ -31,6 +31,33 @@ WORDLEN = 5
 # play a real game against a host whose word we truly don't know.
 
 
+class PlayerScoreCache(dict):
+    def __init__(self):
+        self.hits = 0
+        self.tests = 0
+        super().__init__(self)
+    
+    def get(self, wordlist):
+        v = super().get(wordlist, None)
+        if v:
+            self.hits += 1
+        self.tests += 1
+        if self.tests >= 100000:
+            logging.debug(f'recent cache hits: {int(100 * self.hits / self.tests)}%')
+            self.tests = 0
+            self.hits = 0
+        return v
+
+    def add(self, wordlist, score):
+        if score > self.BIGGISH:
+            return
+            # We don't cache subtrees with losing games because we might
+            # reach that same state by a shorter route and it would be
+            # wrong to use the large score for that.  Ideally we'd build
+            # the entire score cache using unbounded searches.
+        self[wordlist] = score
+
+
 class Response():
     """
     Represents the host's move in the game: feedback about the letters
@@ -150,12 +177,12 @@ class Host():
                                           response,
                                           self,
                                           depth, max_depth)
-            if depth <= debug_host_to_depth:
+            if depth <= debug_host_depth:
                 logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth} {response}:{len(words)} : {score:.5f}')
             total += len(words) * score
         score = total / len(wordlist)
         
-        if depth <= debug_host_to_depth:
+        if depth <= debug_host_depth:
             logging.debug(f'H{depth}  {". "*depth} score {score:.5f}')
         return score
 
@@ -176,12 +203,10 @@ class Player():
      '''
 
     BIGNUM = 1000000   # penalty for not winning
-    BIGGISH =   1000   # anything bigger than this includes a penalty
 
     def __init__(self):
-        self.score_cache = {}
-        self.cache_hits = 0
-        self.cache_test = 0
+        self.score_cache = PlayerScoreCache()
+        self.score_cache.BIGGISH =   1000   # anything bigger than this includes a penalty
 
     def score_position(self, wordlist, host_response, host, depth, max_depth, guess=None):
         '''
@@ -195,34 +220,25 @@ class Player():
             return 1
         if depth == max_depth:
             return self.BIGNUM       # winning is important
-        self.cache_test += 1
-        if self.cache_test % 100000 == 0:
-            logging.debug(f'cache hits: {int(100 * self.cache_hits / self.cache_test)}%')
-        if wordlist in self.score_cache:
-            self.cache_hits += 1
-            return self.score_cache[wordlist]
+        score = self.score_cache.get(wordlist)
+        if score:
+            return score
         depth += 1
         guess_list = [guess] if guess else wordlist
         best_word, best_score = None, None
         n, N = 0, len(guess_list)
         for word in guess_list:
             n += 1
-            # TODO: parallelize
             score = host.score_position(wordlist, word, self, depth, max_depth)
-            if depth <= debug_player_to_depth:
+            if depth <= debug_player_depth:
                 logging.debug(f'P{depth} {int(100*n/N)}%  {". "*depth}  {word} : {score:.5f}')
             if (best_word is None) or score < best_score:
                 best_word = word
                 best_score = score
-        if depth <= debug_player_to_depth:
+        if depth <= debug_player_depth:
             logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({best_score:.5f})')
         score = best_score + 1
-        if score < self.BIGGISH:
-            # We don't cache subtrees with losing games because we might
-            # reach that same state by a shorter route and it would be
-            # wrong to use the large score for that.  Ideally we'd build
-            # the entire score cache using unbounded searches.
-            self.score_cache[wordlist] = score
+        self.score_cache.add(wordlist, score)
         return score
 
     def start(self, wordlist, host, max_depth, guess):
@@ -247,8 +263,8 @@ def main():
                             formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('-d', '--maxdepth', type=int, default=6)
     parser.add_argument('-v', '--verbose', action='store_true')
-    parser.add_argument('--debug_player_to_depth', type=int, default=6)
-    parser.add_argument('--debug_host_to_depth', type=int, default=0)
+    parser.add_argument('--debug_player_depth', type=int, default=6)
+    parser.add_argument('--debug_host_depth', type=int, default=0)
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('wordfile', type=FileType('r'))
     parser.add_argument('startword', nargs="?")
@@ -258,15 +274,14 @@ def main():
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    global debug_host_to_depth, debug_player_to_depth
-    debug_player_to_depth = args.debug_player_to_depth
-    debug_host_to_depth = args.debug_host_to_depth
+    global debug_host_depth, debug_player_depth
+    debug_player_depth = args.debug_player_depth
+    debug_host_depth = args.debug_host_depth
 
     wordlist = WordList(line.strip() for line in args.wordfile.readlines())
 
     player = Player()
     score = player.start(wordlist, Host(), args.maxdepth, args.startword)
-    logging.debug(f'cache hits: {int(100 * player.cache_hits / player.cache_test)}%')
     print(f'{score:.5f} {args.startword or ""}')
 
 if __name__ == '__main__':
