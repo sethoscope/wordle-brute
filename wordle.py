@@ -93,6 +93,12 @@ class WordList():
     def __len__(self):
         return len(self.words)
 
+    def __hash__(self):
+        return hash(self.words)
+
+    def __eq__(self, other):
+        return self.words == other.words
+
     def filter(self, guess, response):
         '''Return a new WordList consistent with guess & response.'''
         # The simplest thing is to make a Response for each word using
@@ -124,8 +130,8 @@ class Host():
         # once and multiply.
 
         # optimization: at maxdepth, we can just return 1/N
-        if depth == max_depth:
-            return 1 / len(wordlist)
+#         if depth == max_depth:
+#             return 1 / len(wordlist)
         
         # Rather than explore the game tree for each word we could
         # choose, we group words that yield the same response.
@@ -148,6 +154,7 @@ class Host():
                 logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth} {response}:{len(words)} : {score:.5f}')
             total += len(words) * score
         score = total / len(wordlist)
+        
         if depth <= debug_host_to_depth:
             logging.debug(f'H{depth}  {". "*depth} score {score:.5f}')
         return score
@@ -168,6 +175,14 @@ class Player():
      - minimize number of turns in best 90% of games
      '''
 
+    BIGNUM = 1000000   # penalty for not winning
+    BIGGISH =   1000   # anything bigger than this includes a penalty
+
+    def __init__(self):
+        self.score_cache = {}
+        self.cache_hits = 0
+        self.cache_test = 0
+
     def score_position(self, wordlist, host_response, host, depth, max_depth, guess=None):
         '''
         Recurse through all possible games from here and return
@@ -175,9 +190,17 @@ class Player():
         If guess is provided, use that instead of trying all possibilities.
         '''
         if host_response and host_response.all_correct():   # we got it last time
+            return 0
+        if len(wordlist) == 1:   # let's not go through all the steps
             return 1
         if depth == max_depth:
-            return 0
+            return self.BIGNUM       # winning is important
+        self.cache_test += 1
+        if self.cache_test % 100000 == 0:
+            logging.debug(f'cache hits: {int(100 * self.cache_hits / self.cache_test)}%')
+        if wordlist in self.score_cache:
+            self.cache_hits += 1
+            return self.score_cache[wordlist]
         depth += 1
         guess_list = [guess] if guess else wordlist
         best_word, best_score = None, None
@@ -188,12 +211,19 @@ class Player():
             score = host.score_position(wordlist, word, self, depth, max_depth)
             if depth <= debug_player_to_depth:
                 logging.debug(f'P{depth} {int(100*n/N)}%  {". "*depth}  {word} : {score:.5f}')
-            if (best_word is None) or score > best_score:
+            if (best_word is None) or score < best_score:
                 best_word = word
                 best_score = score
         if depth <= debug_player_to_depth:
             logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({best_score:.5f})')
-        return best_score
+        score = best_score + 1
+        if score < self.BIGGISH:
+            # We don't cache subtrees with losing games because we might
+            # reach that same state by a shorter route and it would be
+            # wrong to use the large score for that.  Ideally we'd build
+            # the entire score cache using unbounded searches.
+            self.score_cache[wordlist] = score
+        return score
 
     def start(self, wordlist, host, max_depth, guess):
         return self.score_position(wordlist, None, host, 0, max_depth, guess)
@@ -234,7 +264,9 @@ def main():
 
     wordlist = WordList(line.strip() for line in args.wordfile.readlines())
 
-    score = Player().start(wordlist, Host(), args.maxdepth, args.startword)
+    player = Player()
+    score = player.start(wordlist, Host(), args.maxdepth, args.startword)
+    logging.debug(f'cache hits: {int(100 * player.cache_hits / player.cache_test)}%')
     print(f'{score:.5f} {args.startword or ""}')
 
 if __name__ == '__main__':
