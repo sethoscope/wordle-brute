@@ -10,7 +10,8 @@
 
 import logging
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
-from collections import defaultdict
+import pickle
+from collections import defaultdict, UserDict
 
 WORDLEN = 5
 
@@ -31,10 +32,11 @@ WORDLEN = 5
 # play a real game against a host whose word we truly don't know.
 
 
-class PlayerScoreCache(dict):
+class PlayerScoreCache(UserDict):
     def __init__(self):
         self.hits = 0
         self.tests = 0
+        self.dirty = True
         super().__init__(self)
     
     def get(self, wordlist):
@@ -56,6 +58,30 @@ class PlayerScoreCache(dict):
             # wrong to use the large score for that.  Ideally we'd build
             # the entire score cache using unbounded searches.
         self[wordlist] = score
+        self.dirty = True
+
+    def save(self, filename):
+        if self.dirty:
+            # TODO: make this atomic (by writing to temp file & renaming)
+            with open(filename, 'wb') as f:
+                logging.debug('Saving player score cache.')
+                pickle.dump(self.data, f)
+        self.dirty = False
+
+    def load(self, filename):
+        try:
+            with open(filename, 'rb') as f:
+                logging.debug('Loading player score cache.')
+                self.data = pickle.load(f)
+        except FileNotFoundError:
+            logging.warning(f'Cache file {filename} not found. Starting fresh.')
+        self.dirty = False
+
+    def merge_load(self, filename):
+        self.dirty = True
+        with open(filename, 'rb') as f:
+            logging.debug('Loading player score cache.')
+            self.data.update(pickle.load(f))
 
 
 class Response():
@@ -110,28 +136,14 @@ class Response():
         return ''.join(self.DEBUGCHAR[t] for t in self.tags)
 
 
-class WordList():
-    def __init__(self, words):
-        self.words = frozenset(words)
-
-    def __iter__(self):
-        return iter(self.words)
-
-    def __len__(self):
-        return len(self.words)
-
-    def __hash__(self):
-        return hash(self.words)
-
-    def __eq__(self, other):
-        return self.words == other.words
-
+class WordList(frozenset):
     def filter(self, guess, response):
         '''Return a new WordList consistent with guess & response.'''
         # The simplest thing is to make a Response for each word using
         # the guess and see if it matches what we're given. It's not
         # very fast though, so we do other things to rule out some
         # words.
+        # TODO: is this helping enough or should I get rid of it?
         must = set(L for i,L in enumerate(guess) if response.tags[i] != Response.ABSENT)
         mustnot = set(L for i,L in enumerate(guess) if response.tags[i] == Response.ABSENT and L not in must)
         matches = [(i,L) for i,L in enumerate(guess) if response.tags[i] == Response.CORRECT]
@@ -195,8 +207,7 @@ class Host():
 
 class Player():
     '''
-    Players choose a word that maximizes something. Some examples of
-    possible metrics:
+    Players choose a word that optimizes some metric. Examples:
      - maximize likelihood of winning in 6 turns
      - minimize mean number of turns
      - minimize number of turns in best 90% of games
@@ -238,7 +249,8 @@ class Player():
         if depth <= debug_player_depth:
             logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({best_score:.5f})')
         score = best_score + 1
-        self.score_cache.add(wordlist, score)
+        if not guess:  # If we only tried one word, we can't score this state
+            self.score_cache.add(wordlist, score)
         return score
 
     def start(self, wordlist, host, max_depth, guess):
@@ -263,6 +275,8 @@ def main():
                             formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('-d', '--maxdepth', type=int, default=6)
     parser.add_argument('-v', '--verbose', action='store_true')
+    # TODO: read from one cache file, write to another
+    parser.add_argument('--cache', metavar='FILENAME', help='score cache file')
     parser.add_argument('--debug_player_depth', type=int, default=6)
     parser.add_argument('--debug_host_depth', type=int, default=0)
     parser.add_argument('--debug', action='store_true')
@@ -281,8 +295,12 @@ def main():
     wordlist = WordList(line.strip() for line in args.wordfile.readlines())
 
     player = Player()
+    if args.cache:
+        player.score_cache.load(args.cache)
     score = player.start(wordlist, Host(), args.maxdepth, args.startword)
     print(f'{score:.5f} {args.startword or ""}')
+    if args.cache:
+        player.score_cache.save(args.cache)
 
 if __name__ == '__main__':
     main()
