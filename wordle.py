@@ -40,8 +40,8 @@ class PlayerScoreCache(UserDict):
         super().__init__(self)
     
     def get(self, wordlist):
-        v = super().get(wordlist, None)
-        if v:
+        v = super().get(wordlist, (None, None))
+        if v[0]:
             self.hits += 1
         self.tests += 1
         if self.tests >= 100000:
@@ -50,14 +50,20 @@ class PlayerScoreCache(UserDict):
             self.hits = 0
         return v
 
-    def add(self, wordlist, score):
+    def get_score(self, wordlist):
+        return self.get(wordlist)[0]
+
+    def get_best_choice(self, wordlist):
+        return self.get(wordlist)[0]
+
+    def add(self, wordlist, score, best_word):
         if score > self.BIGGISH:
             return
             # We don't cache subtrees with losing games because we might
             # reach that same state by a shorter route and it would be
             # wrong to use the large score for that.  Ideally we'd build
             # the entire score cache using unbounded searches.
-        self[wordlist] = score
+        self[wordlist] = (score, best_word)
         self.dirty = True
 
     def save(self, filename):
@@ -231,7 +237,7 @@ class Player():
             return 1
         if depth == max_depth:
             return self.BIGNUM       # winning is important
-        score = self.score_cache.get(wordlist)
+        score = self.score_cache.get_score(wordlist)
         if score:
             return score
         depth += 1
@@ -250,7 +256,7 @@ class Player():
             logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({best_score:.5f})')
         score = best_score + 1
         if not guess:  # If we only tried one word, we can't score this state
-            self.score_cache.add(wordlist, score)
+            self.score_cache.add(wordlist, score, best_word)
         return score
 
     def start(self, wordlist, host, max_depth, guess):
