@@ -13,8 +13,6 @@ from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
 import pickle
 from collections import defaultdict, UserDict
 
-WORDLEN = 5
-
 
 # The way we organize this is as a two-player game. On the human's turn,
 # she guesses a word. Then the computer/host plays by choosing a word
@@ -235,6 +233,8 @@ class Player():
             return 0
         if len(wordlist) == 1:   # let's not go through all the steps
             return 1
+        if len(wordlist) == 2:   # We'll guess it now or next.
+            return 1.5
         if depth == max_depth:
             return self.BIGNUM       # winning is important
         score = self.score_cache.get_score(wordlist)
