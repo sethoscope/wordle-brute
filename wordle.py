@@ -315,8 +315,6 @@ class Player():
 
 
 
-# TODO: allow caller to provide a game so far, guesses and responses.
-
 def main():
     logging.basicConfig(format='%(relativeCreated)8d ms  // %(message)s')
     description = 'wordle solver'
