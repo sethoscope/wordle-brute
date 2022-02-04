@@ -11,7 +11,7 @@
 import logging
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
 import pickle
-from collections import defaultdict, UserDict
+from collections import defaultdict, ChainMap
 
 
 # The way we organize this is as a two-player game. On the human's turn,
@@ -30,12 +30,11 @@ from collections import defaultdict, UserDict
 # play a real game against a host whose word we truly don't know.
 
 
-class PlayerScoreCache(UserDict):
-    def __init__(self):
+class PlayerScoreCache(ChainMap):
+    def __init__(self, *args):
         self.hits = 0
         self.tests = 0
-        self.dirty = True
-        super().__init__(self)
+        super().__init__(self, {}, *args)
     
     def get(self, wordlist):
         v = super().get(wordlist, (None, None))
@@ -62,30 +61,28 @@ class PlayerScoreCache(UserDict):
             # wrong to use the large score for that.  Ideally we'd build
             # the entire score cache using unbounded searches.
         self[wordlist] = (score, best_word)
-        self.dirty = True
 
-    def save(self, filename):
-        if self.dirty:
-            # TODO: make this atomic (by writing to temp file & renaming)
-            with open(filename, 'wb') as f:
-                logging.debug('Saving player score cache.')
-                pickle.dump(self.data, f)
-        self.dirty = False
+    def save_all(self, filename):
+        # TODO: make this atomic (by writing to temp file & renaming)
+        with open(filename, 'wb') as f:
+            logging.debug('Saving entire player score cache.')
+            pickle.dump(dict(self), f)
 
-    def load(self, filename):
-        try:
-            with open(filename, 'rb') as f:
-                logging.debug('Loading player score cache.')
-                self.data = pickle.load(f)
-        except FileNotFoundError:
-            logging.warning(f'Cache file {filename} not found. Starting fresh.')
-        self.dirty = False
+    def save_new(self, filename):
+        # TODO: make this atomic (by writing to temp file & renaming)
+        with open(filename, 'wb') as f:
+            logging.debug('Saving player score cache updates.')
+            pickle.dump(self.maps[0], f)
 
-    def merge_load(self, filename):
-        self.dirty = True
-        with open(filename, 'rb') as f:
-            logging.debug('Loading player score cache.')
-            self.data.update(pickle.load(f))
+    def load(self, filenames):
+        self.maps = [{}]
+        for filename in filenames:
+            try:
+                with open(filename, 'rb') as f:
+                    logging.debug('Loading player score cache.')
+                    self.maps.append(pickle.load(f))
+            except FileNotFoundError:
+                logging.warning(f'Cache file {filename} not found.')
 
 
 class Response():
@@ -282,7 +279,13 @@ def main():
     parser.add_argument('-d', '--maxdepth', type=int, default=6)
     parser.add_argument('-v', '--verbose', action='store_true')
     # TODO: read from one cache file, write to another
-    parser.add_argument('--cache', metavar='FILENAME', help='score cache file')
+    parser.add_argument('--cache_in', metavar='FILENAME',
+                        nargs='+',
+                        help='input score cache file(s)')
+    parser.add_argument('--cache_out', metavar='FILENAME',
+                        help='output score cache entries')
+    parser.add_argument('--cache_out_updates', metavar='FILENAME',
+                        help='output only new score cache entries')
     parser.add_argument('--debug_player_depth', type=int, default=6)
     parser.add_argument('--debug_host_depth', type=int, default=0)
     parser.add_argument('--debug', action='store_true')
@@ -301,12 +304,14 @@ def main():
     wordlist = WordList(line.strip() for line in args.wordfile.readlines())
 
     player = Player()
-    if args.cache:
-        player.score_cache.load(args.cache)
+    if args.cache_in:
+        player.score_cache.load(args.cache_in)
     score = player.start(wordlist, Host(), args.maxdepth, args.startword)
     print(f'{score:.5f} {args.startword or ""}')
-    if args.cache:
-        player.score_cache.save(args.cache)
+    if args.cache_out:
+        player.score_cache.save_all(args.cache_out)
+    if args.cache_out_updates:
+        player.score_cache.save_new(args.cache_out_updates)
 
 if __name__ == '__main__':
     main()
