@@ -69,7 +69,7 @@ class PlayerScoreCache(ChainMap):
         return self.get(wordlist)[0]
 
     def get_best_choice(self, wordlist):
-        return self.get(wordlist)[0]
+        return self.get(wordlist)[1]
 
     def add(self, wordlist, score, best_word):
         if score > self.BIGGISH:
@@ -273,7 +273,8 @@ class Player():
         return score
 
     def start(self, wordlist, host, max_depth, guess):
-        return self.score_position(wordlist, None, host, 0, max_depth, guess)
+        return (self.score_position(wordlist, None, host, 0, max_depth, guess),
+                self.score_cache.get_best_choice(wordlist))
 
 
 # Score is likelihood of winning within the depth searched.
@@ -322,8 +323,8 @@ def main():
     player = Player()
     if args.cache_in:
         player.score_cache.load(args.cache_in)
-    score = player.start(wordlist, Host(), args.maxdepth, args.startword)
-    print(f'{score:.5f} {args.startword or ""}')
+    score, word = player.start(wordlist, Host(), args.maxdepth, args.startword)
+    print(f'{score:.5f} {args.startword or word}')
     if args.cache_out:
         player.score_cache.save_all(args.cache_out)
     if args.cache_out_updates:
