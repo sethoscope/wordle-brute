@@ -285,14 +285,14 @@ class Player():
 
 
 
-# TODO: allow caller to specify a word for the player to guess first.
 # TODO: allow caller to provide a game so far, guesses and responses.
 
 def main():
-    description = ''
+    logging.basicConfig(format='%(relativeCreated)8d ms  // %(message)s')
+    description = 'wordle solver'
     parser = ArgumentParser(description=description,
                             formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-d', '--maxdepth', type=int, default=6)
+    parser.add_argument('-d', '--maxdepth', type=int, default=9999)
     parser.add_argument('-v', '--verbose', action='store_true')
     # TODO: read from one cache file, write to another
     parser.add_argument('--cache_in', metavar='FILENAME',
