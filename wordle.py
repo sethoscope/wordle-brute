@@ -12,6 +12,8 @@ import logging
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
 import pickle
 from collections import defaultdict, ChainMap
+from tempfile import NamedTemporaryFile
+import os
 
 
 # The way we organize this is as a two-player game. On the human's turn,
@@ -28,6 +30,22 @@ from collections import defaultdict, ChainMap
 # The reason we do things this way, rather than choosing a secret word
 # at the outset, is that it's simple to model and could be deployed to
 # play a real game against a host whose word we truly don't know.
+
+class AtomicFileWriter():
+    '''
+    Writes to a temp file, then moves file into place when finished.
+    '''
+    def __init__(self, filename):
+        self.filename = filename
+        self.f = NamedTemporaryFile(dir=os.path.dirname(filename),
+                                    delete=False)
+
+    def __enter__(self):
+        return self.f
+
+    def __exit__(self, type, value, traceback):
+        self.f.close()
+        os.rename(self.f.name, self.filename)
 
 
 class PlayerScoreCache(ChainMap):
@@ -63,15 +81,13 @@ class PlayerScoreCache(ChainMap):
         self[wordlist] = (score, best_word)
 
     def save_all(self, filename):
-        # TODO: make this atomic (by writing to temp file & renaming)
-        with open(filename, 'wb') as f:
-            logging.debug('Saving entire player score cache.')
+        logging.debug('Saving entire player score cache.')
+        with AtomicFileWriter(filename) as f:
             pickle.dump(dict(self), f)
 
     def save_new(self, filename):
-        # TODO: make this atomic (by writing to temp file & renaming)
-        with open(filename, 'wb') as f:
-            logging.debug('Saving player score cache updates.')
+        logging.debug('Saving player score cache updates.')
+        with AtomicFileWriter(filename) as f:
             pickle.dump(self.maps[0], f)
 
     def load(self, filenames):
