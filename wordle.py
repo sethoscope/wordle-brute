@@ -52,7 +52,7 @@ class PlayerScoreCache(ChainMap):
     def __init__(self, *args):
         self.hits = 0
         self.tests = 0
-        super().__init__(self, {}, *args)
+        super().__init__({}, *args)
     
     def get(self, wordlist):
         v = super().get(wordlist, (None, None))
