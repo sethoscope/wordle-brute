@@ -11,7 +11,7 @@
 import logging
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, FileType
 import pickle
-from collections import defaultdict, ChainMap
+from collections import defaultdict, ChainMap, UserList
 from tempfile import NamedTemporaryFile
 import os
 
@@ -48,27 +48,58 @@ class AtomicFileWriter():
         os.rename(self.f.name, self.filename)
 
 
+class Histogram(UserList):
+    '''
+    Like Counter, but indexes will just be small ints, so we use a list.
+    '''
+    def __getitem__(self, i):
+        if i >= len(self):
+            self.extend([0] * (i - len(self) + 1))
+        return UserList.__getitem__(self, i)
+    
+    def __setitem__(self, i, v):
+        if i >= len(self):
+            self.extend([0] * (i - len(self) + 1))
+        UserList.__setitem__(self, i, v)
+    
+    def update(self, other):
+        #logging.debug(f'updating histogram {self} with {other}')
+        for i in range(len(other)):
+            self[i] += other[i]
+
+    def shift_right(self):
+        self.data = [0] + self.data
+
+    def to_chart(self, width=20):
+        maxval = max(self.data)
+        width = min(width, maxval)
+        return '\n'.join(f'{i}: '
+                         + ('*' * int(self[i] * width / maxval))
+                         + (f'  ({self[i]})' if self[i] else '')
+                         for i in range(1, len(self)))
+
+class Evaluation():
+    '''
+    This is where we store anything we learned from evaluating a game state.
+    '''
+    def __init__(self, score=0, best_word=None, histogram=None):
+        self.score = score
+        self.best_word = best_word
+        self.histogram = histogram or Histogram()
+    
+
 class PlayerScoreCache(ChainMap):
     def __init__(self, *args):
         super().__init__({}, *args)
     
-    def get(self, wordlist):
-        return super().get(wordlist, (None, None))
-
-    def get_score(self, wordlist):
-        return self.get(wordlist)[0]
-
-    def get_best_choice(self, wordlist):
-        return self.get(wordlist)[1]
-
-    def add(self, wordlist, score, best_word):
-        if score > self.BIGGISH:
+    def add(self, wordlist, evaluation):
+        if evaluation.score > self.BIGGISH:
             return
             # We don't cache subtrees with losing games because we might
             # reach that same state by a shorter route and it would be
             # wrong to use the large score for that.  Ideally we'd build
             # the entire score cache using unbounded searches.
-        self[wordlist] = (score, best_word)
+        self[wordlist] = evaluation
 
     def save_all(self, filename):
         logging.debug('Saving entire player score cache.')
@@ -175,10 +206,6 @@ class Host():
         # many words cause each one. Then we'll follow each one just
         # once and multiply.
 
-        # optimization: at maxdepth, we can just return 1/N
-#         if depth == max_depth:
-#             return 1 / len(wordlist)
-        
         # Rather than explore the game tree for each word we could
         # choose, we group words that yield the same response.
         by_response = defaultdict(set)
@@ -187,23 +214,23 @@ class Host():
             #n += 1
             #logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth}  response for {w}')
             by_response[Response.from_guess(w, player_guess)].add(w)
-        total = 0.0
         n, N = 0, len(by_response)
+        ev = Evaluation(0.0)
         for response,words in by_response.items():
             n += 1
             # TODO: parallelize, even if just at depth 1
-            score = player.score_position(WordList(words),
-                                          response,
-                                          self,
-                                          depth, max_depth)
+            pev = player.score_position(WordList(words),
+                                       response,
+                                       self,
+                                       depth, max_depth)
             if depth <= debug_host_depth:
-                logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth} {response}:{len(words)} : {score:.5f}')
-            total += len(words) * score
-        score = total / len(wordlist)
+                logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth} {response}:{len(words)} : {ev.score:.5f}')
+            ev.score += len(words) * pev.score / len(wordlist)
+            ev.histogram.update(pev.histogram)
         
         if depth <= debug_host_depth:
-            logging.debug(f'H{depth}  {". "*depth} score {score:.5f}')
-        return score
+            logging.debug(f'H{depth}  {". "*depth} score {ev.score:.5f}')
+        return ev
 
 
 # Rather than make the Host know about depth & max_depth, we could give
@@ -233,38 +260,35 @@ class Player():
         If guess is provided, use that instead of trying all possibilities.
         '''
         if host_response and host_response.all_correct():   # we got it last time
-            return 0
-        if len(wordlist) == 1:   # let's not go through all the steps
-            return 1
-        if len(wordlist) == 2:   # We'll guess it now or next.
-            return 1.5
+            return Evaluation(0, '', Histogram((1,)))
         if depth == max_depth:
-            return self.BIGNUM       # winning is important
-        score = self.score_cache.get_score(wordlist)
-        if score:
-            return score
+            return Evaluation(self.BIGNUM, '', Histogram())       # winning is important
+        try:
+            return self.score_cache[wordlist]
+        except KeyError:
+            pass
         depth += 1
         guess_list = [guess] if guess else wordlist
-        best_word, best_score = None, None
         n, N = 0, len(guess_list)
+        ev = None
         for word in guess_list:
             n += 1
-            score = host.score_position(wordlist, word, self, depth, max_depth)
+            hev = host.score_position(wordlist, word, self, depth, max_depth)
             if depth <= debug_player_depth:
-                logging.debug(f'P{depth} {int(100*n/N)}%  {". "*depth}  {word} : {score:.5f}')
-            if (best_word is None) or score < best_score:
-                best_word = word
-                best_score = score
+                logging.debug(f'P{depth} {int(100*n/N)}%  {". "*depth}  {word} : {hev.score:.5f}')
+            if (ev is None) or hev.score < ev.score:
+                ev = hev
+                ev.best_word = word
         if depth <= debug_player_depth:
-            logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({best_score:.5f})')
-        score = best_score + 1
+            logging.debug(f'P{depth}  {". "*depth}best word: {ev.best_word} ({ev.score:.5f})')
+        ev.score += 1
+        ev.histogram.shift_right()
         if not guess:  # If we only tried one word, we can't score this state
-            self.score_cache.add(wordlist, score, best_word)
-        return score
+            self.score_cache.add(wordlist, ev)
+        return ev
 
     def start(self, wordlist, host, max_depth, guess):
-        return (self.score_position(wordlist, None, host, 0, max_depth, guess),
-                self.score_cache.get_best_choice(wordlist))
+        return self.score_position(wordlist, None, host, 0, max_depth, guess)
 
 
 # Score is likelihood of winning within the depth searched.
@@ -285,7 +309,8 @@ def main():
                             formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('-d', '--maxdepth', type=int, default=9999)
     parser.add_argument('-v', '--verbose', action='store_true')
-    # TODO: read from one cache file, write to another
+    parser.add_argument('--histogram', action='store_true')
+    parser.add_argument('--histogram_width', type=int, default=72)
     parser.add_argument('--cache_in', metavar='FILENAME',
                         nargs='+',
                         help='input score cache file(s)')
@@ -313,8 +338,10 @@ def main():
     player = Player()
     if args.cache_in:
         player.score_cache.load(args.cache_in)
-    score, word = player.start(wordlist, Host(), args.maxdepth, args.startword)
-    print(f'{score:.5f} {args.startword or word}')
+    ev = player.start(wordlist, Host(), args.maxdepth, args.startword)
+    print(f'{ev.score:.5f} {args.startword or ev.best_word}')
+    if args.histogram:
+        print(ev.histogram.to_chart(args.histogram_width))
     if args.cache_out:
         player.score_cache.save_all(args.cache_out)
     if args.cache_out_updates:
