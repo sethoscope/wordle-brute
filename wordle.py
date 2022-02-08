@@ -14,7 +14,7 @@ import pickle
 from collections import defaultdict, ChainMap, UserList
 from tempfile import NamedTemporaryFile
 import os
-
+import multiprocessing
 
 # The way we organize this is as a two-player game. On the human's turn,
 # she guesses a word. Then the computer/host plays by choosing a word
@@ -86,7 +86,10 @@ class Evaluation():
         self.score = score
         self.best_word = best_word
         self.histogram = histogram or Histogram()
-    
+
+    def __lt__(self, other):
+        return self.score < other.score
+
 
 class PlayerScoreCache(ChainMap):
     def __init__(self, *args):
@@ -218,7 +221,6 @@ class Host():
         ev = Evaluation(0.0)
         for response,words in by_response.items():
             n += 1
-            # TODO: parallelize, even if just at depth 1
             pev = player.score_position(WordList(words),
                                        response,
                                        self,
@@ -253,7 +255,22 @@ class Player():
         self.score_cache = PlayerScoreCache()
         self.score_cache.BIGGISH =   1000   # anything bigger than this includes a penalty
 
-    def score_position(self, wordlist, host_response, host, depth, max_depth, guess=None):
+    # We do this because we can't use lambda with multiprocessing
+    class _BoundHostCall():
+        def __init__(self, player, host, wordlist, depth, max_depth):
+            self.player = player
+            self.host = host
+            self.wordlist = wordlist
+            self.depth = depth
+            self.max_depth = max_depth
+            
+        def __call__(self, word):
+            return (self.host.score_position(self.wordlist, word, self.player,
+                                             self.depth, self.max_depth),
+                    word)
+
+    def score_position(self, wordlist, host_response, host, depth, max_depth,
+                       guess=None, procs=1):
         '''
         Recurse through all possible games from here and return
         probability-weighted average score of those games.
@@ -269,26 +286,24 @@ class Player():
             pass
         depth += 1
         guess_list = [guess] if guess else wordlist
-        n, N = 0, len(guess_list)
-        ev = None
-        for word in guess_list:
-            n += 1
-            hev = host.score_position(wordlist, word, self, depth, max_depth)
-            if depth <= debug_player_depth:
-                logging.debug(f'P{depth} {int(100*n/N)}%  {". "*depth}  {word} : {hev.score:.5f}')
-            if (ev is None) or hev.score < ev.score:
-                ev = hev
-                ev.best_word = word
+        get_ev = self._BoundHostCall(self, host, wordlist, depth, max_depth)
+        procs = min(procs, len(guess_list))
+        if procs <= 1:
+            ev, best_word = min(map(get_ev, guess_list))
+        else:
+            with multiprocessing.Pool(procs) as pool:
+                ev, best_word = min(pool.map(get_ev, guess_list))
         if depth <= debug_player_depth:
-            logging.debug(f'P{depth}  {". "*depth}best word: {ev.best_word} ({ev.score:.5f})')
+            logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({ev.score:.5f})')
+        ev.best_word = best_word
         ev.score += 1
         ev.histogram.shift_right()
         if not guess:  # If we only tried one word, we can't score this state
             self.score_cache.add(wordlist, ev)
         return ev
 
-    def start(self, wordlist, host, max_depth, guess):
-        return self.score_position(wordlist, None, host, 0, max_depth, guess)
+    def start(self, wordlist, host, max_depth, guess, procs):
+        return self.score_position(wordlist, None, host, 0, max_depth, guess, procs)
 
 
 # Score is likelihood of winning within the depth searched.
@@ -318,6 +333,9 @@ def main():
                         help='output score cache entries')
     parser.add_argument('--cache_out_updates', metavar='FILENAME',
                         help='output only new score cache entries')
+    parser.add_argument('--procs', type=int,
+                        default=multiprocessing.cpu_count(),
+                        help='number of parallel processes')
     parser.add_argument('--debug_player_depth', type=int, default=6)
     parser.add_argument('--debug_host_depth', type=int, default=0)
     parser.add_argument('--debug', action='store_true')
@@ -338,7 +356,7 @@ def main():
     player = Player()
     if args.cache_in:
         player.score_cache.load(args.cache_in)
-    ev = player.start(wordlist, Host(), args.maxdepth, args.startword)
+    ev = player.start(wordlist, Host(), args.maxdepth, args.startword, args.procs)
     print(f'{ev.score:.5f} {args.startword or ev.best_word}')
     if args.histogram:
         print(ev.histogram.to_chart(args.histogram_width))
