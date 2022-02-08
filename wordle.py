@@ -50,20 +50,10 @@ class AtomicFileWriter():
 
 class PlayerScoreCache(ChainMap):
     def __init__(self, *args):
-        self.hits = 0
-        self.tests = 0
         super().__init__({}, *args)
     
     def get(self, wordlist):
-        v = super().get(wordlist, (None, None))
-        if v[0]:
-            self.hits += 1
-        self.tests += 1
-        if self.tests >= 100000:
-            logging.debug(f'recent cache hits: {int(100 * self.hits / self.tests)}%')
-            self.tests = 0
-            self.hits = 0
-        return v
+        return super().get(wordlist, (None, None))
 
     def get_score(self, wordlist):
         return self.get(wordlist)[0]
