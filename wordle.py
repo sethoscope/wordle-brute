@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 #
-# This code will simulate and solve Wordle games.  In fact, it's
-# playing a slightly different game, in which the computer opponent
-# chooses a new word at each step, but with the word choice algorithm,
-# it's indistinguishable from Wordle (and it's easier to model).
+# Explore possible Wordle games and find the optimal guesses.
 #
 # 2022-01-18  Seth Golub <entropy@gmail.com>
 
@@ -30,40 +27,39 @@ import multiprocessing
 # The reason we do things this way, rather than choosing a secret word
 # at the outset, is that it's simple to model and could be deployed to
 # play a real game against a host whose word we truly don't know.
-
-class AtomicFileWriter():
-    '''
-    Writes to a temp file, then moves file into place when finished.
-    '''
-    def __init__(self, filename):
-        self.filename = filename
-        self.f = NamedTemporaryFile(dir=os.path.dirname(filename),
-                                    delete=False)
-
-    def __enter__(self):
-        return self.f
-
-    def __exit__(self, type, value, traceback):
-        self.f.close()
-        os.rename(self.f.name, self.filename)
+# If we wanted to add constraints like "use the word of the day", that
+# could just as easily be applied by the host at each turn.
+#
+# There's one big divergence from actual Wordle though. I only have
+# the player guess words that might potentially be the answer. This
+# manifests in two ways:
+#   1. I use the same word list for both Player and Host. This is
+#      mostly about convenience and wouldn't be hard to change.
+#   2. The player only guesses words that are consistent with all the
+#      feedback. This is similar to playing Wordle in "hard mode" and
+#      is probably not optimal! So that's a big caveat on whatever we
+#      learn from this. But having ~13K options instead of ~2K would
+#      probably impact running time significantly, so I've left it
+#      like this for now. Further optimizations, parallelism, or
+#      search pruning could easily make this feasible.
 
 
 class Histogram(UserList):
     '''
-    Like Counter, but indexes will just be small ints, so we use a list.
+    Like Counter, but indexes will just be small ints, and we fill gaps.
+    We use this to see how many guesses all the subsequent games take.
     '''
     def __getitem__(self, i):
         if i >= len(self):
             self.extend([0] * (i - len(self) + 1))
         return UserList.__getitem__(self, i)
-    
+
     def __setitem__(self, i, v):
         if i >= len(self):
             self.extend([0] * (i - len(self) + 1))
         UserList.__setitem__(self, i, v)
-    
+
     def update(self, other):
-        #logging.debug(f'updating histogram {self} with {other}')
         for i in range(len(other)):
             self[i] += other[i]
 
@@ -77,6 +73,7 @@ class Histogram(UserList):
                          + ('*' * int(self[i] * width / maxval))
                          + (f'  ({self[i]})' if self[i] else '')
                          for i in range(1, len(self)))
+
 
 class Evaluation():
     '''
@@ -92,9 +89,20 @@ class Evaluation():
 
 
 class PlayerScoreCache(ChainMap):
+    '''
+    We can cache the subtree score values and save ourselves a lot of
+    time.  We assume we are using a metric that is independent of how
+    we got here, so the state is defined only by which words remain as
+    possible solutions. A metric that cared about whether we would solve
+    the game within six guesses (for example) would need to include
+    "guesses remaining" in the game state and the cache would not
+    perform as well.
+
+    The cache is not shared between processes.
+   '''
     def __init__(self, *args):
         super().__init__({}, *args)
-    
+
     def add(self, wordlist, evaluation):
         if evaluation.score > self.BIGGISH:
             return
@@ -106,12 +114,12 @@ class PlayerScoreCache(ChainMap):
 
     def save_all(self, filename):
         logging.debug('Saving entire player score cache.')
-        with AtomicFileWriter(filename) as f:
+        with open(filename, 'wb') as f:
             pickle.dump(dict(self), f)
 
     def save_new(self, filename):
         logging.debug('Saving player score cache updates.')
-        with AtomicFileWriter(filename) as f:
+        with open(filename, 'wb') as f:
             pickle.dump(self.maps[0], f)
 
     def load(self, filenames):
@@ -135,9 +143,9 @@ class Response():
     PRESENT = 1
     CORRECT = 2
 
-    DEBUGCHAR = {0 : '.',
-                 1 : 'x',
-                 2 : 'O'}
+    DEBUGCHAR = {0: '.',
+                 1: 'x',
+                 2: 'O'}
 
     def __init__(self, tags):
         self.tags = tuple(tags)
@@ -149,7 +157,7 @@ class Response():
         guess_avail = [True] * len(guess)
         target_avail = [True] * len(target)
         result = [cls.ABSENT] * len(guess)
-        
+
         for i in range(len(guess)):
             if guess[i] == target[i] and target_avail[i]:
                 result[i] = cls.CORRECT
@@ -161,9 +169,9 @@ class Response():
                 for j in range(len(target)):
                     if target_avail[j] and (guess[i] == target[j]):
                         result[i] = cls.PRESENT
-                        target_avail[j] = False;
+                        target_avail[j] = False
         return cls(result)
-    
+
     def all_correct(self):
         return all(t == self.CORRECT for t in self.tags)
 
@@ -184,52 +192,47 @@ class WordList(frozenset):
         # the guess and see if it matches what we're given. It's not
         # very fast though, so we do other things to rule out some
         # words.
-        # TODO: is this helping enough or should I get rid of it?
-        must = set(L for i,L in enumerate(guess) if response.tags[i] != Response.ABSENT)
-        mustnot = set(L for i,L in enumerate(guess) if response.tags[i] == Response.ABSENT and L not in must)
-        matches = [(i,L) for i,L in enumerate(guess) if response.tags[i] == Response.CORRECT]
+        # TODO: is these helping enough to bother?
+        must = set(L for i, L in enumerate(guess)
+                   if response.tags[i] != Response.ABSENT)
+        mustnot = set(L for i, L in enumerate(guess)
+                      if response.tags[i] == Response.ABSENT and L not in must)
+        matches = [(i, L) for i, L in enumerate(guess)
+                   if response.tags[i] == Response.CORRECT]
         return self.__class__(w for w in self.words
                               if (must <= set(w) and
                                   mustnot.isdisjoint(set(w)) and
-                                  all(w[i] == L for (i,L) in matches) and
+                                  all(w[i] == L for (i, L) in matches) and
                                   Response.from_guess(w, guess) == response))
 
 
 class Host():
     '''
-    The opponent
+    The opponent, who chooses a word the player tries to guess.
     '''
     def score_position(self, wordlist, player_guess, player, depth, max_depth):
         '''
         Recurse through all possible games from here and return
-        probability-weighted average score of those games.
-        (For standard Wordle, all words are equally likely.)
+        the average score of those games.
         '''
         # First we figure out all possible responses, along with how
-        # many words cause each one. Then we'll follow each one just
+        # many words yield each one. Then we'll follow each one just
         # once and multiply.
-
-        # Rather than explore the game tree for each word we could
-        # choose, we group words that yield the same response.
         by_response = defaultdict(set)
-        #n, N = 0, len(wordlist)
         for w in wordlist:
-            #n += 1
-            #logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth}  response for {w}')
             by_response[Response.from_guess(w, player_guess)].add(w)
-        n, N = 0, len(by_response)
         ev = Evaluation(0.0)
-        for response,words in by_response.items():
-            n += 1
+        for response, words in by_response.items():
             pev = player.score_position(WordList(words),
-                                       response,
-                                       self,
-                                       depth, max_depth)
+                                        response,
+                                        self,
+                                        depth, max_depth)
             if depth <= debug_host_depth:
-                logging.debug(f'H{depth} {int(100*n/N)}%  {". "*depth} {response}:{len(words)} : {ev.score:.5f}')
+                logging.debug(f'H{depth}  {". "*depth}'
+                              f'{response}:{len(words)} : {ev.score:.5f}')
             ev.score += len(words) * pev.score / len(wordlist)
             ev.histogram.update(pev.histogram)
-        
+
         if depth <= debug_host_depth:
             logging.debug(f'H{depth}  {". "*depth} score {ev.score:.5f}')
         return ev
@@ -243,17 +246,14 @@ class Host():
 
 class Player():
     '''
-    Players choose a word that optimizes some metric. Examples:
-     - maximize likelihood of winning in 6 turns
-     - minimize mean number of turns
-     - minimize number of turns in best 90% of games
-     '''
+    The player, who makes a guess (and evaluates the utility of game states).
+    '''
 
     BIGNUM = 1000000   # penalty for not winning
 
     def __init__(self):
         self.score_cache = PlayerScoreCache()
-        self.score_cache.BIGGISH =   1000   # anything bigger than this includes a penalty
+        self.score_cache.BIGGISH = 1000   # bigger must include a penalty
 
     # We do this because we can't use lambda with multiprocessing
     class _BoundHostCall():
@@ -263,7 +263,7 @@ class Player():
             self.wordlist = wordlist
             self.depth = depth
             self.max_depth = max_depth
-            
+
         def __call__(self, word):
             return (self.host.score_position(self.wordlist, word, self.player,
                                              self.depth, self.max_depth),
@@ -272,14 +272,14 @@ class Player():
     def score_position(self, wordlist, host_response, host, depth, max_depth,
                        guess=None, procs=1):
         '''
-        Recurse through all possible games from here and return
-        probability-weighted average score of those games.
-        If guess is provided, use that instead of trying all possibilities.
+        Recurse through all possible games from here and return the
+        score of the path we would choose to take.  A guess can be
+        provided, in which case we only try that one.
         '''
-        if host_response and host_response.all_correct():   # we got it last time
+        if host_response and host_response.all_correct():   # got it last time
             return Evaluation(0, '', Histogram((1,)))
         if depth == max_depth:
-            return Evaluation(self.BIGNUM, '', Histogram())       # winning is important
+            return Evaluation(self.BIGNUM, '', Histogram())  # penalize losing
         try:
             return self.score_cache[wordlist]
         except KeyError:
@@ -294,7 +294,8 @@ class Player():
             with multiprocessing.Pool(procs) as pool:
                 ev, best_word = min(pool.map(get_ev, guess_list))
         if depth <= debug_player_depth:
-            logging.debug(f'P{depth}  {". "*depth}best word: {best_word} ({ev.score:.5f})')
+            logging.debug(f'P{depth}  {". "*depth}'
+                          f'best word: {best_word} ({ev.score:.5f})')
         ev.best_word = best_word
         ev.score += 1
         ev.histogram.shift_right()
@@ -303,16 +304,8 @@ class Player():
         return ev
 
     def start(self, wordlist, host, max_depth, guess, procs):
-        return self.score_position(wordlist, None, host, 0, max_depth, guess, procs)
-
-
-# Score is likelihood of winning within the depth searched.
-# There are other options:
-#   highest likelihood that P% of games will end in N more turns
-#   smallest weighted mean number of remaining moves to win
-#   smallest median number of remaining moves to win
-
-
+        return self.score_position(wordlist, None, host, 0, max_depth,
+                                   guess, procs)
 
 
 def main():
@@ -354,7 +347,8 @@ def main():
     player = Player()
     if args.cache_in:
         player.score_cache.load(args.cache_in)
-    ev = player.start(wordlist, Host(), args.maxdepth, args.startword, args.procs)
+    ev = player.start(wordlist, Host(), args.maxdepth, args.startword,
+                      args.procs)
     print(f'{ev.score:.5f} {args.startword or ev.best_word}')
     if args.histogram:
         print(ev.histogram.to_chart(args.histogram_width))
@@ -362,6 +356,7 @@ def main():
         player.score_cache.save_all(args.cache_out)
     if args.cache_out_updates:
         player.score_cache.save_new(args.cache_out_updates)
+
 
 if __name__ == '__main__':
     main()
