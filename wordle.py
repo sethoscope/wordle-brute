@@ -79,10 +79,11 @@ class Evaluation():
     '''
     This is where we store anything we learned from evaluating a game state.
     '''
-    def __init__(self, score=0, best_word=None, histogram=None):
+    def __init__(self, score=0, best_word=None, histogram=None, failures=None):
         self.score = score
         self.best_word = best_word
         self.histogram = histogram or Histogram()
+        self.failures = failures or set()
 
     def __lt__(self, other):
         return self.score < other.score
@@ -104,12 +105,6 @@ class PlayerScoreCache(ChainMap):
         super().__init__({}, *args)
 
     def add(self, wordlist, evaluation):
-        if evaluation.score > self.BIGGISH:
-            return
-            # We don't cache subtrees with losing games because we might
-            # reach that same state by a shorter route and it would be
-            # wrong to use the large score for that.  Ideally we'd build
-            # the entire score cache using unbounded searches.
         self[wordlist] = evaluation
 
     def save_all(self, filename):
@@ -210,38 +205,22 @@ class Host():
     '''
     The opponent, who chooses a word the player tries to guess.
     '''
-    def score_position(self, wordlist, player_guess, player, depth, max_depth):
+    def score_position(self, wordlist, player_guess, get_player_score):
         '''
         Recurse through all possible games from here and return
         the average score of those games.
         '''
-        # First we figure out all possible responses, along with how
-        # many words yield each one. Then we'll follow each one just
-        # once and multiply.
+        # First we group words by the resonses they yield.
         by_response = defaultdict(set)
         for w in wordlist:
             by_response[Response.from_guess(w, player_guess)].add(w)
         ev = Evaluation(0.0)
         for response, words in by_response.items():
-            pev = player.score_position(WordList(words),
-                                        response,
-                                        self,
-                                        depth, max_depth)
-            if depth <= debug_host_depth:
-                logging.debug(f'H{depth}  {". "*depth}'
-                              f'{response}:{len(words)} : {ev.score:.5f}')
+            pev = get_player_score(WordList(words), response)
             ev.score += len(words) * pev.score / len(wordlist)
             ev.histogram.update(pev.histogram)
-
-        if depth <= debug_host_depth:
-            logging.debug(f'H{depth}  {". "*depth} score {ev.score:.5f}')
+            ev.failures.update(pev.failures)
         return ev
-
-
-# Rather than make the Host know about depth & max_depth, we could give
-# it a callback and bake the depth in with a lambda closure. Then only
-# the player code has to see it. But it's nice to have it for debug
-# output.
 
 
 class Player():
@@ -253,7 +232,6 @@ class Player():
 
     def __init__(self):
         self.score_cache = PlayerScoreCache()
-        self.score_cache.BIGGISH = 1000   # bigger must include a penalty
 
     # We do this because we can't use lambda with multiprocessing
     class _BoundHostCall():
@@ -265,8 +243,11 @@ class Player():
             self.max_depth = max_depth
 
         def __call__(self, word):
-            return (self.host.score_position(self.wordlist, word, self.player,
-                                             self.depth, self.max_depth),
+            player_call = lambda wordlist, host_response: \
+                          self.player.score_position(wordlist, host_response,
+                                                     self.host, self.depth + 1,
+                                                     self.max_depth)
+            return (self.host.score_position(self.wordlist, word, player_call),
                     word)
 
     def score_position(self, wordlist, host_response, host, depth, max_depth,
@@ -278,13 +259,14 @@ class Player():
         '''
         if host_response and host_response.all_correct():   # got it last time
             return Evaluation(0, '', Histogram((1,)))
-        if depth == max_depth:
-            return Evaluation(self.BIGNUM, '', Histogram())  # penalize losing
+        if max_depth and depth > max_depth:
+            return Evaluation(self.BIGNUM * len(wordlist), # penalize losing
+                              '', Histogram([0, len(wordlist)]),
+                              failures=wordlist)
         try:
             return self.score_cache[wordlist]
         except KeyError:
             pass
-        depth += 1
         guess_list = [guess] if guess else wordlist
         get_ev = self._BoundHostCall(self, host, wordlist, depth, max_depth)
         procs = min(procs, len(guess_list))
@@ -299,12 +281,12 @@ class Player():
         ev.best_word = best_word
         ev.score += 1
         ev.histogram.shift_right()
-        if not guess:  # If we only tried one word, we can't score this state
+        if not max_depth and not guess: # only cache in unbounded searches
             self.score_cache.add(wordlist, ev)
         return ev
 
     def start(self, wordlist, host, max_depth, guess, procs):
-        return self.score_position(wordlist, None, host, 0, max_depth,
+        return self.score_position(wordlist, None, host, 1, max_depth,
                                    guess, procs)
 
 
@@ -313,7 +295,7 @@ def main():
     description = 'wordle solver'
     parser = ArgumentParser(description=description,
                             formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('-d', '--maxdepth', type=int, default=9999)
+    parser.add_argument('-d', '--maxdepth', type=int, default=0)
     parser.add_argument('-v', '--verbose', action='store_true')
     parser.add_argument('--histogram', action='store_true')
     parser.add_argument('--histogram_width', type=int, default=72)
@@ -350,6 +332,8 @@ def main():
     ev = player.start(wordlist, Host(), args.maxdepth, args.startword,
                       args.procs)
     print(f'{ev.score:.5f} {args.startword or ev.best_word}')
+    if args.verbose and ev.failures:
+        print(f'Failed to guess these words: {", ".join(ev.failures)}')
     if args.histogram:
         print(ev.histogram.to_chart(args.histogram_width))
     if args.cache_out:
